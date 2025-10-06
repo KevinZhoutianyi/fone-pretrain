@@ -17,23 +17,28 @@ This repository implements **FoNE (Fourier Number Embedding)** for pretraining a
 fone-pretrain/
 ├── README.md                    # This file
 ├── requirements.txt             # Python dependencies
-├── accelerate_config.yaml       # DeepSpeed ZeRO-3 configuration
-├── VALIDATION.md                # Validation system documentation
+├── setup_env.sh                 # Environment variables and outputs roots
 ├── configs/
-│   ├── llama_1p5b_fone.json    # Model configuration
-│   ├── data_mixture.json       # Training data mixture
-│   ├── validation_data.json    # Validation data configuration
-│   └── validation_prompts.json # Text generation prompts
+│   ├── accelerate_2gpu.yaml     # Accelerate/DeepSpeed config (2 GPUs)
+│   ├── accelerate_8gpu.yaml     # Accelerate/DeepSpeed config (8 GPUs)
+│   ├── llama_0p5b.json          # 0.5B model config
+│   ├── llama_1p5b.json          # 1.5B model config
+│   ├── data_mixture.hf.json     # Training data mixture
+│   ├── validation_data.json     # Perplexity eval data config
+│   └── validation_prompts.json  # Text generation prompts
 ├── src/
-│   ├── data/                   # Data loading and processing
-│   ├── modeling/               # FoNE model implementation
-│   ├── train/                  # Training scripts
-│   └── eval/                   # Validation and evaluation
+│   ├── data/                    # Data loading and processing
+│   ├── modeling/                # FoNE model implementation
+│   ├── train/                   # Training entrypoints
+│   └── eval/                    # Validation / evaluation entrypoints
+├── eval/
+│   └── consolidate.py           # Consolidate ZeRO-3 ckpt and run text-gen eval
 └── scripts/
-    ├── train_debug.sh/.sbatch  # Debug training (quick test)
-    ├── train_full.sh/.sbatch   # Full training (production)
-    ├── manual_validation.sh    # Validate existing checkpoints
-    └── eval_gsm8k.sbatch       # Math reasoning evaluation
+    ├── pretrain_0p5b_2gpu.sh    # 0.5B pretraining (interactive)
+    ├── pretrain_1p5b_2gpu.sh    # 1.5B pretraining (interactive)
+    ├── pretrain_0p5b_8gpu.sbatch # 0.5B pretraining (SLURM)
+    ├── pretrain_1p5b_8gpu.sbatch # 1.5B pretraining (SLURM)
+    └── consolidate_and_eval.py  # Consolidate + run text-gen eval helper
 ```
 
 ## 🚀 Quick Start
@@ -51,29 +56,51 @@ pip install -r requirements.txt
 
 ### 2. Run Training
 
-**Debug Training** (recommended first - 10M tokens, 2 hours):
+Interactive (2 GPUs):
 ```bash
-# Local/interactive
-./scripts/train_debug.sh
+# 0.5B
+bash scripts/pretrain_0p5b_2gpu.sh
 
-# Or submit to SLURM
-sbatch scripts/train_debug.sbatch
+# 1.5B
+bash scripts/pretrain_1p5b_2gpu.sh
 ```
 
-**Full Training** (production - 30B tokens, 48 hours):
+SLURM (8 GPUs):
 ```bash
-# Local/interactive  
-./scripts/train_full.sh
+# 0.5B
+sbatch scripts/pretrain_0p5b_8gpu.sbatch
 
-# Or submit to SLURM
-sbatch scripts/train_full.sbatch
+# 1.5B
+sbatch scripts/pretrain_1p5b_8gpu.sbatch
 ```
 
-### 3. Validate Your Model
+### 3. Validate Your Model (Perplexity + Text Generation)
 
+Text generation quick-check (consolidate ZeRO-3 -> single model, then run eval):
 ```bash
-# Test any checkpoint
-./scripts/manual_validation.sh /path/to/checkpoint step_number
+python eval/consolidate.py \
+  --ckpt /path/to/outputs/pretrain_*/step_150000 \
+  --config configs/llama_1p5b.json \
+  --prompts_file configs/validation_prompts.json \
+  --num_samples 1 \
+  --eval_root /path/to/eval_root   # or export FONE_EVAL_DIR
+```
+
+Perplexity or text-gen evaluation directly:
+```bash
+# Perplexity
+python src/eval/perplexity_eval.py \
+  --model /path/to/model_or_ckpt_dir \
+  --validation_data configs/validation_data.json \
+  --seq_len 2048 --max_samples 1000 \
+  --output_file eval/perplexity.json
+
+# Text generation
+python src/eval/text_generation_eval.py \
+  --model /path/to/model_or_ckpt_dir \
+  --prompts_file configs/validation_prompts.json \
+  --num_samples 1 --max_new_tokens 200 \
+  --output_file eval/text_gen.json
 ```
 
 ## 🔍 Validation System
@@ -102,26 +129,47 @@ See [VALIDATION.md](VALIDATION.md) for complete details.
 
 ## 🔧 Configuration
 
-### Training Parameters
+### Training Parameters (from scripts/configs)
 
-| Parameter | Debug | Full |
-|-----------|-------|------|
-| Total Tokens | 10M | 30B |
-| Sequence Length | 512 | 2048 |
-| Learning Rate | 2e-4 | 2e-4 |
-| Batch Size | 2 | 2 |
-| GPUs | 1 | 4 |
-| Time | ~2h | ~48h |
-| Validation | Every 200 steps | Every 2000 steps |
+- Sequence length: 2048 (default; configurable via `--seq_len`)
+- Optimizer: AdamW (`weight_decay` 0.1)
+- Warmup steps: 1000
+- Logging every: 100 steps (`--log_every_steps`)
+- Checkpoint every: 10000 steps (`--save_every_steps`)
+- Mixed precision: bfloat16 (Accelerate configs)
+
+Interactive 2-GPU defaults (configs/accelerate_2gpu.yaml):
+- Per-device micro-batch: 8
+- Grad accumulation: 4
+- Effective micro-batch per step: 8 × 4 × 2 GPUs = 64 sequences
+
+8-GPU SLURM defaults:
+- 0.5B (`scripts/pretrain_0p5b_8gpu.sbatch`): `--per_device_train_batch_size 24`, `--gradient_accumulation_steps 4`
+- 1.5B (`scripts/pretrain_1p5b_8gpu.sbatch`): per-device micro-batch 2, grad accumulation 2 (from `configs/accelerate_8gpu.yaml`)
+
+Total tokens targets (approximate):
+- 0.5B: 10B tokens (`--total_tokens 10000000000`)
+- 1.5B: 20B tokens (`--total_tokens 20000000000`)
+
+Learning rate:
+- 0.5B 8-GPU: `2e-4`
+- Other scripts: `3e-4`
 
 ### Model Architecture
 
-- **Layers**: 26
-- **Hidden Size**: 2048  
-- **Attention Heads**: 16
-- **Vocab Size**: 128,256
-- **FoNE Numbers**: 0-999 (frozen Fourier embeddings)
-- **Parameters**: ~1.5B total
+0.5B (`configs/llama_0p5b.json`):
+- Layers: 16
+- Hidden size: 1024
+- Attention heads: 16
+- Intermediate size: 2752
+
+1.5B (`configs/llama_1p5b.json`):
+- Layers: 26
+- Hidden size: 2048
+- Attention heads: 16
+- Intermediate size: 5504
+
+Tokenizer: default `meta-llama/Llama-3.1-8B` (configurable via `--tokenizer`); its vocab size is 128256.
 
 ## 🏗️ Technical Details
 
@@ -134,7 +182,7 @@ FoNE replaces standard embeddings for numbers 0-999 with:
 
 ### Training Infrastructure
 
-- **DeepSpeed ZeRO-3**: CPU offloading for memory efficiency
+- **DeepSpeed ZeRO-3**: Enabled via Accelerate configs (CPU offloading enabled on 8-GPU config)
 - **FlashAttention-2**: Optional fast attention (full training only)
 - **Gradient Accumulation**: 16 steps
 - **Mixed Precision**: bfloat16
@@ -149,13 +197,7 @@ Training automatically logs to:
 
 ## 🔬 Evaluation
 
-After training, evaluate mathematical reasoning:
-
-```bash
-sbatch scripts/eval_gsm8k.sbatch
-```
-
-This runs GSM8K evaluation with self-consistency for robust math performance assessment.
+This repo focuses on: (1) pretraining and (2) perplexity + text-generation evaluation. SFT and GSM8K scripts were removed to keep scope minimal.
 
 ## 🐛 Troubleshooting
 
@@ -178,8 +220,8 @@ If you use this code, please cite:
 ```bibtex
 @misc{fone-pretraining,
   title={FoNE: Fourier Number Embeddings for Language Model Pretraining},
-  author={Your Name},
-  year={2024},
-  url={https://github.com/yourusername/fone-pretrain}
+  author={Zhou, Tianyi},
+  year={2025},
+  url={https://github.com/KevinZhoutianyi/fone-pretrain}
 }
 ```

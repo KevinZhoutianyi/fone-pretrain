@@ -1,15 +1,15 @@
 # FoNE Refined Pipeline Guide
 
-This guide provides a complete walkthrough for running the refined FoNE experiments comparing 0.5B and 1.5B models on mathematical reasoning tasks.
+This guide provides a walkthrough for FoNE pretraining (0.5B and 1.5B) and evaluation via perplexity and text generation.
 
 ## 🎯 Experiment Overview
 
-The pipeline consists of 4 main experiments:
+The pipeline consists of two stages:
 
-1. **Pretrain 0.5B** → SFT on GSM8K → Evaluate
-2. **Pretrain 1.5B** → SFT on GSM8K → Evaluate  
+1. **Pretrain** (0.5B or 1.5B)
+2. **Evaluate** (perplexity + text generation)  
 
-Each experiment can be run in two modes:
+Each stage can be run in two modes:
 - **Interactive (2-GPU)**: For development and debugging
 - **SLURM (4-GPU)**: For production runs
 
@@ -28,12 +28,7 @@ fone-pretrain/
 │   ├── pretrain_0p5b_4gpu.sbatch # 0.5B pretrain (SLURM)
 │   ├── pretrain_1p5b_2gpu.sh    # 1.5B pretrain (interactive)
 │   ├── pretrain_1p5b_4gpu.sbatch # 1.5B pretrain (SLURM)
-│   ├── sft_0p5b_2gpu.sh         # 0.5B SFT (interactive)
-│   ├── sft_0p5b_4gpu.sbatch     # 0.5B SFT (SLURM)
-│   ├── sft_1p5b_2gpu.sh         # 1.5B SFT (interactive)
-│   ├── sft_1p5b_4gpu.sbatch     # 1.5B SFT (SLURM)
-│   ├── eval_0p5b_gsm8k.sh       # 0.5B evaluation
-│   └── eval_1p5b_gsm8k.sh       # 1.5B evaluation
+│   └── consolidate_and_eval.py  # Consolidate + text-gen eval helper
 └── outputs/                     # All experiment outputs
 ```
 
@@ -63,27 +58,25 @@ bash scripts/pretrain_0p5b_2gpu.sh
 sbatch scripts/pretrain_0p5b_4gpu.sbatch
 ```
 
-#### Step 2: Supervised Fine-Tuning
+#### Step 2: Evaluation
 
-**Interactive (2-GPU):**
+Perplexity:
 ```bash
-# Replace with your actual pretrained model path
-bash scripts/sft_0p5b_2gpu.sh outputs/pretrain_0p5b_20241218_143022
+python src/eval/perplexity_eval.py \
+  --model /work/hdd/.../outputs/pretrain_0p5b_YYYYMMDD_HHMMSS/step_150000 \
+  --validation_data configs/validation_data.json \
+  --seq_len 2048 --max_samples 1000 \
+  --output_file eval/pretrain_0p5b_.../step_150000/perplexity.json
 ```
 
-**SLURM (4-GPU):**
+Text generation:
 ```bash
-sbatch --export=PRETRAINED_MODEL=outputs/pretrain_0p5b_20241218_143022 scripts/sft_0p5b_4gpu.sbatch
-```
-
-#### Step 3: Evaluation
-
-```bash
-# Evaluate pretrained model only
-bash scripts/eval_0p5b_gsm8k.sh outputs/pretrain_0p5b_20241218_143022
-
-# Evaluate with SFT LoRA adapter
-bash scripts/eval_0p5b_gsm8k.sh outputs/pretrain_0p5b_20241218_143022 outputs/sft_0p5b_gsm8k_20241218_163045
+python eval/consolidate.py \
+  --ckpt /work/hdd/.../outputs/pretrain_0p5b_YYYYMMDD_HHMMSS/step_150000 \
+  --config configs/llama_0p5b.json \
+  --prompts_file configs/validation_prompts.json \
+  --num_samples 1 \
+  --eval_root eval
 ```
 
 ### Experiment 2: Llama 1.5B
@@ -100,27 +93,9 @@ bash scripts/pretrain_1p5b_2gpu.sh
 sbatch scripts/pretrain_1p5b_4gpu.sbatch
 ```
 
-#### Step 2: Supervised Fine-Tuning
+#### Step 2: Evaluation
 
-**Interactive (2-GPU):**
-```bash
-bash scripts/sft_1p5b_2gpu.sh outputs/pretrain_1p5b_20241218_143022
-```
-
-**SLURM (4-GPU):**
-```bash
-sbatch --export=PRETRAINED_MODEL=outputs/pretrain_1p5b_20241218_143022 scripts/sft_1p5b_4gpu.sbatch
-```
-
-#### Step 3: Evaluation
-
-```bash
-# Evaluate pretrained model only
-bash scripts/eval_1p5b_gsm8k.sh outputs/pretrain_1p5b_20241218_143022
-
-# Evaluate with SFT LoRA adapter  
-bash scripts/eval_1p5b_gsm8k.sh outputs/pretrain_1p5b_20241218_143022 outputs/sft_1p5b_gsm8k_20241218_163045
-```
+Perplexity and text generation: see 0.5B examples above (swap configs/paths for 1.5B).
 
 ## ⚙️ Configuration Details
 
@@ -134,7 +109,7 @@ bash scripts/eval_1p5b_gsm8k.sh outputs/pretrain_1p5b_20241218_143022 outputs/sf
 | Intermediate Size | 2752 | 5504 |
 | Parameters | ~0.5B | ~1.5B |
 
-### Training Settings
+### Training Settings (pretraining)
 
 #### Pretraining
 - **Dataset**: FineWeb (65%) + OpenWebMath (25%) + The Stack v2 (10%)
@@ -143,17 +118,9 @@ bash scripts/eval_1p5b_gsm8k.sh outputs/pretrain_1p5b_20241218_143022 outputs/sf
 - **Training Steps**: 50,000
 - **Warmup Steps**: 1,000
 
-#### SFT (Supervised Fine-Tuning)
-- **Dataset**: GSM8K training set
-- **Method**: LoRA (Low-Rank Adaptation)
-- **LoRA Rank**: 16
-- **Learning Rate**: 1e-4
-- **Epochs**: 3
-
 #### Evaluation
-- **Dataset**: GSM8K test set (1,319 problems)
-- **Few-Shot Settings**: 0, 1, 3, 5 examples
-- **Temperature**: 0.1 (low for mathematical reasoning)
+- Perplexity: configs/validation_data.json (or HF datasets)
+- Text generation: configs/validation_prompts.json (diverse prompts)
 
 ### Resource Requirements
 
