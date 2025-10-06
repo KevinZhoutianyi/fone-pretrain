@@ -1,0 +1,77 @@
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyTorch
+*.pth
+*.pt
+
+# Logs
+logs/
+*.log
+
+# Experiment tracking
+wandb/
+
+# Checkpoints
+ckpts/
+checkpoints/
+outputs/
+results/
+
+# Evaluation artifacts (keep scripts at top-level only)
+eval/**
+!eval/*.py
+!eval/*.md
+
+# Jupyter
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+test_data.jsonl
+test_data_config.json
+accelerate_config_test.yaml
+accelerate_config_job.yaml
+
+# Model weights (never commit large binaries)
+*.safetensors
+*.bin
+
+# Caches
+.cache/
+**/.cache/

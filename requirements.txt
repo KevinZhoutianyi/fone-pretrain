@@ -1,0 +1,27 @@
+# FoNE Pretraining Requirements
+# Python 3.10+ required
+
+# Core ML packages
+torch>=2.3
+transformers>=4.43
+datasets>=2.20
+accelerate>=0.33
+deepspeed>=0.14
+
+# Flash Attention (install with --no-build-isolation)
+flash-attn>=2.5.6
+
+# Fine-tuning and training utilities
+peft>=0.12
+trl>=0.9.6
+
+# Tokenization and data processing
+sentencepiece
+numpy
+tqdm
+pyarrow
+ujson
+
+# Additional utilities
+wandb  # for experiment tracking (optional)
+tensorboard  # for logging (optional)
