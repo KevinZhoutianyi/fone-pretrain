@@ -66,6 +66,17 @@ class DataMixture:
         self.shuffle_buffer_size = shuffle_buffer_size
         self.num_workers = num_workers
         self.seed = seed
+        # Distributed sharding (Accelerate sets RANK/WORLD_SIZE)
+        try:
+            self.rank = int(os.environ.get('RANK', '0'))
+        except Exception:
+            self.rank = 0
+        try:
+            self.world_size = int(os.environ.get('WORLD_SIZE', '1'))
+        except Exception:
+            self.world_size = 1
+        # Disable streaming shuffle by default to avoid heavy shard enumeration
+        self.disable_streaming_shuffle = os.environ.get('FONE_DISABLE_STREAMING_SHUFFLE', '1').lower() in ('1', 'true', 'yes')
         
         # Load mixture configuration
         with open(mixture_config, 'r') as f:
@@ -126,6 +137,8 @@ class DataMixture:
                         ds = load_dataset('json', data_files=file_path, split='train')
                     elif file_path.endswith('.txt'):
                         ds = load_dataset('text', data_files=file_path, split='train')
+                    elif file_path.endswith('.parquet'):
+                        ds = load_dataset('parquet', data_files=file_path, split='train')
                     else:
                         logger.warning(f"Unknown file format: {file_path}")
                         continue
@@ -149,6 +162,8 @@ class DataMixture:
                 return load_dataset('json', data_files=path, split='train')
             elif path_obj.suffix == '.txt':
                 return load_dataset('text', data_files=path, split='train')
+            elif path_obj.suffix == '.parquet':
+                return load_dataset('parquet', data_files=path, split='train')
             else:
                 # Try to load as a HuggingFace dataset
                 return load_dataset(path, split='train')
@@ -166,16 +181,35 @@ class DataMixture:
         if cache_dir:
             cache_dir = os.path.join(cache_dir, '.cache', 'huggingface', 'datasets')
         
-        load_kwargs = dict(streaming=True, split=split, cache_dir=cache_dir)
+        # Prefer native split slicing per-rank to avoid post-hoc sharding when supported
+        requested_split = split
+        if self.world_size > 1 and '[' not in split:
+            requested_split = f"{split}[{self.rank}::{self.world_size}]"
+        load_kwargs = dict(streaming=True, split=requested_split, cache_dir=cache_dir)
         
         # First try without trust_remote_code
         try:
-            if config:
-                ds = load_dataset(hf_name, config, **load_kwargs)
-            else:
-                ds = load_dataset(hf_name, **load_kwargs)
-            # Shuffle streaming iterator with buffer
-            ds = ds.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer_size)
+            try:
+                if config:
+                    ds = load_dataset(hf_name, config, **load_kwargs)
+                else:
+                    ds = load_dataset(hf_name, **load_kwargs)
+                loaded_with_slice = True
+            except ValueError as ve:
+                # Fallback: dataset does not support split slicing, load base split WITHOUT sharding
+                # For large datasets like DCLM, sharding enumerates all shards which is slow
+                # Instead, let all ranks read from the same stream; randomness in mixture sampling
+                # will naturally give different data per rank
+                base_kwargs = dict(streaming=True, split=split, cache_dir=cache_dir)
+                if config:
+                    ds = load_dataset(hf_name, config, **base_kwargs)
+                else:
+                    ds = load_dataset(hf_name, **base_kwargs)
+                loaded_with_slice = False
+                logger.warning(f"Loaded {name} without per-rank sharding (dataset too large); relying on mixture sampling for diversity")
+            # Optional shuffle (disabled by default for performance)
+            if not self.disable_streaming_shuffle and self.shuffle_buffer_size and self.shuffle_buffer_size > 1:
+                ds = ds.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer_size)
             return ds
         except RuntimeError as e:
             if "Dataset scripts are no longer supported" in str(e):
@@ -187,8 +221,8 @@ class DataMixture:
                         ds = load_dataset(hf_name, config, **load_kwargs)
                     else:
                         ds = load_dataset(hf_name, **load_kwargs)
-                    # Shuffle streaming iterator with buffer
-                    ds = ds.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer_size)
+                    if not self.disable_streaming_shuffle and self.shuffle_buffer_size and self.shuffle_buffer_size > 1:
+                        ds = ds.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer_size)
                     return ds
                 except Exception as e2:
                     logger.error(f"Failed to load stream {name} ({hf_name}) even with trust_remote_code=True: {e2}")
@@ -227,8 +261,8 @@ class DataMixture:
                     logger.info(f"Loading dataset: {name}")
                     dataset = self._load_dataset_from_path(path, name)
                     
-                    # Shuffle dataset
-                    dataset = dataset.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer_size)
+                    # Shuffle dataset (map-style datasets use 'seed' only, not 'buffer_size')
+                    dataset = dataset.shuffle(seed=self.seed)
                     
                     self.datasets[name] = dataset
                     
@@ -242,15 +276,22 @@ class DataMixture:
         """Get iterator for a specific dataset with infinite cycling."""
         dataset = self.datasets[name]
         
-        while True:
-            if isinstance(dataset, IterableDataset):
-                # Streaming dataset: can re-shuffle with a new seed
-                shuffled_dataset = dataset.shuffle(seed=self.rng.randint(0, 2**32-1), buffer_size=self.shuffle_buffer_size)
-                for example in shuffled_dataset:
-                    yield example
+        if isinstance(dataset, IterableDataset):
+            # Streaming dataset: iterate once (HF streaming is already infinite)
+            # Optionally disable shuffle to avoid heavy shard enumeration
+            if self.disable_streaming_shuffle or not self.shuffle_buffer_size or self.shuffle_buffer_size <= 1:
+                iterable = dataset
             else:
-                # Map-style dataset
-                shuffled_dataset = dataset.shuffle(seed=self.rng.randint(0, 2**32-1), buffer_size=self.shuffle_buffer_size)
+                iterable = dataset.shuffle(
+                    seed=self.seed,
+                    buffer_size=self.shuffle_buffer_size,
+                )
+            for example in iterable:
+                yield example
+        else:
+            # Map-style dataset: infinite cycling with re-shuffle
+            while True:
+                shuffled_dataset = dataset.shuffle(seed=self.rng.randint(0, 2**32-1))
                 for example in shuffled_dataset:
                     yield example
                 

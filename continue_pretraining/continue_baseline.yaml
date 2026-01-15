@@ -1,0 +1,30 @@
+# Continue Pretraining Configuration - Baseline Model
+# Loads from: Onlydrinkwater/baseline-1p5b-step-76294
+# Continues training on MegaMath-web-pro
+
+model_name_or_path: Onlydrinkwater/baseline-1p5b-step-76294
+data_config: data_megamath.json
+
+# FoNE is not used for baseline (no special number embeddings)
+fone_hi: -1  # Disabled for baseline
+
+# Training hyperparameters (lower LR for continue pretrain)
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 4
+learning_rate: 1.0e-5
+warmup_steps: 500
+weight_decay: 0.1
+log_every_steps: 10
+
+# Distributed training
+num_processes: 8
+mixed_precision: bf16
+dataloader_num_workers: 0
+
+# Wandb logging
+wandb_project: fone-continue-pretrain
+wandb_run_name: baseline_1p5b_megamath
+
+# HuggingFace upload (final checkpoint only)
+hf_repo_id: Onlydrinkwater/baseline-1p5b-megamath
+

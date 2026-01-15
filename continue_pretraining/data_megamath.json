@@ -1,0 +1,14 @@
+{
+  "datasets": [
+    {
+      "name": "megamath_web_pro",
+      "path": "/data/megamath-web-pro/megamath-web-pro/*.parquet",
+      "weight": 1.0
+    }
+  ],
+  "total_tokens_target": 15000000000,
+  "sequence_length": 2048,
+  "shuffle_buffer_size": 10000,
+  "num_workers": 0
+}
+

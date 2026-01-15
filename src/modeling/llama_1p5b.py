@@ -131,10 +131,14 @@ def setup_llama_with_fone(
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
+    # Calculate frozen embedding parameters
+    embed_layer = model.get_input_embeddings()
+    frozen_params = fone_info['num_overridden'] * model.config.hidden_size
+    
     logger.info(f"Model statistics:")
     logger.info(f"  Total parameters: {total_params:,}")
     logger.info(f"  Trainable parameters: {trainable_params:,}")
-    logger.info(f"  FoNE overridden embeddings: {fone_info['num_overridden']}")
+    logger.info(f"  FoNE frozen embeddings: {fone_info['num_overridden']} rows ({frozen_params:,} parameters)")
     logger.info(f"  Added tokens: {len(fone_info['added_tokens'])}")
     
     return model, tokenizer, fone_info

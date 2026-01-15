@@ -16,6 +16,7 @@ import logging
 import math
 import json
 import time
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -25,13 +26,14 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import get_cosine_schedule_with_warmup
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import set_seed, DistributedDataParallelKwargs
 import wandb
 
 # Add src to path for imports
 sys.path.append(str(Path(__file__).parent.parent))
 
 from modeling.llama_1p5b import setup_llama_with_fone
+from modeling.fone_init import finalize_fone_embeddings
 from data.mixture import DataMixture
 from data.packing import StreamingPackedDataset
 
@@ -75,9 +77,9 @@ def parse_args():
                        help="Number of warmup steps")
     parser.add_argument("--total_tokens", type=int, default=30_000_000_000,
                        help="Total tokens to train on")
-    parser.add_argument("--total_tokens_scope", type=str, default="per_device",
+    parser.add_argument("--total_tokens_scope", type=str, default="global",
                        choices=["global", "per_device"],
-                       help="Interpretation scope for total_tokens: global across all GPUs or per_device")
+                       help="Interpretation scope for total_tokens: global across all GPUs (default) or per_device")
     parser.add_argument("--weight_decay", type=float, default=0.1,
                        help="Weight decay")
     parser.add_argument("--beta1", type=float, default=0.9,
@@ -116,8 +118,8 @@ def parse_args():
     # Technical arguments
     parser.add_argument("--flash_attn", action="store_true",
                        help="Use FlashAttention-2")
-    parser.add_argument("--activation_checkpointing", action="store_true", default=True,
-                       help="Use activation checkpointing")
+    parser.add_argument("--activation_checkpointing", action="store_true", default=False,
+                       help="Use activation checkpointing (disabled by default for DDP stability)")
     parser.add_argument("--dataloader_num_workers", type=int, default=0,
                        help="Number of dataloader workers")
     
@@ -132,6 +134,14 @@ def parse_args():
     # Resume training
     parser.add_argument("--resume_from", type=str, default=None,
                        help="Resume training from checkpoint")
+    
+    # Hugging Face Hub upload
+    parser.add_argument("--hf_repo_id", type=str, default=None,
+                       help="Hugging Face repo ID to upload checkpoints (e.g., 'username/fone-1p5b')")
+    parser.add_argument("--no_cleanup_after_upload", action="store_false", dest="cleanup_after_upload",
+                       help="Don't remove local checkpoints after uploading to HuggingFace (default: cleanup enabled)")
+    parser.add_argument("--keep_local_checkpoints", action="store_true",
+                       help="Keep local checkpoints even after upload")
     
     return parser.parse_args()
 
@@ -149,12 +159,13 @@ def compute_training_steps(
     
     logger.info(f"Training configuration:")
     logger.info(f"  Total tokens: {total_tokens:,}")
-    logger.info(f"  Tokens per update: {tokens_per_update:,}")
-    logger.info(f"  Total steps: {total_steps:,}")
-    logger.info(f"  Micro batch size: {micro_batch_size}")
+    logger.info(f"  Batch size per GPU: {micro_batch_size}")
     logger.info(f"  Sequence length: {sequence_length}")
     logger.info(f"  Gradient accumulation steps: {gradient_accumulation_steps}")
-    logger.info(f"  Number of processes: {num_processes}")
+    logger.info(f"  Number of GPUs: {num_processes}")
+    logger.info(f"  Tokens per GPU per step: {micro_batch_size * sequence_length * gradient_accumulation_steps:,}")
+    logger.info(f"  Tokens per update (all GPUs): {tokens_per_update:,}")
+    logger.info(f"  Total optimizer steps: {total_steps:,}")
     
     return total_steps
 
@@ -203,10 +214,23 @@ def save_checkpoint(
     tokenizer,
     step: int,
     output_dir: str,
-    fone_info: Dict[str, Any]
+    fone_info: Dict[str, Any],
+    hf_repo_id: Optional[str] = None,
+    fone_hi: int = 999,
+    cleanup_after_upload: bool = True,
+    keep_local: bool = False
 ):
-    """Save model checkpoint."""
+    """Save model checkpoint and optionally upload to HF Hub."""
     checkpoint_dir = os.path.join(output_dir, f"step_{step}")
+    
+    # Finalize FoNE embeddings with trained projection before saving
+    if accelerator.is_main_process:
+        unwrapped_model = accelerator.unwrap_model(model)
+        finalize_fone_embeddings(unwrapped_model, tokenizer, hi=fone_hi)
+        if fone_hi >= 0:
+            logger.info("Finalized FoNE embeddings before saving")
+        else:
+            logger.info("Baseline model (no FoNE) - skipped finalization")
     
     # Save with accelerator (handles DeepSpeed state)
     accelerator.save_state(checkpoint_dir)
@@ -228,6 +252,48 @@ def save_checkpoint(
             json.dump(fone_config, f, indent=2)
             
         logger.info(f"Saved checkpoint at step {step} to {checkpoint_dir}")
+        
+        # Upload to Hugging Face Hub if repo_id provided
+        if hf_repo_id:
+            try:
+                from huggingface_hub import HfApi
+                api = HfApi()
+                
+                # Upload checkpoint
+                repo_checkpoint_id = f"{hf_repo_id}-step-{step}"
+                logger.info(f"Uploading checkpoint to {repo_checkpoint_id}...")
+                
+                # Create repo if it doesn't exist
+                try:
+                    api.create_repo(repo_id=repo_checkpoint_id, exist_ok=True, private=False)
+                    logger.info(f"Created/verified repo {repo_checkpoint_id}")
+                except Exception as e:
+                    logger.warning(f"Could not create repo {repo_checkpoint_id}: {e}")
+                
+                # Upload files
+                api.upload_folder(
+                    folder_path=checkpoint_dir,
+                    repo_id=repo_checkpoint_id,
+                    commit_message=f"FoNE 1.5B checkpoint at step {step}",
+                    create_pr=False
+                )
+                
+                logger.info(f"✅ Successfully uploaded checkpoint to {repo_checkpoint_id}")
+                logger.info(f"🔗 View at: https://huggingface.co/{repo_checkpoint_id}")
+                
+                # Cleanup local checkpoint if requested
+                if cleanup_after_upload and not keep_local:
+                    try:
+                        logger.info(f"🧹 Removing local checkpoint: {checkpoint_dir}")
+                        size = sum(f.stat().st_size for f in Path(checkpoint_dir).rglob('*') if f.is_file())
+                        shutil.rmtree(checkpoint_dir)
+                        logger.info(f"✅ Freed {size / 1e9:.2f} GB (checkpoint backed up on HuggingFace)")
+                    except Exception as cleanup_error:
+                        logger.warning(f"Failed to cleanup local checkpoint: {cleanup_error}")
+                
+            except Exception as e:
+                logger.error(f"Failed to upload checkpoint to HF Hub: {e}")
+                logger.info("Continuing training without upload...")
 
 
 def load_checkpoint(
@@ -383,7 +449,9 @@ def main():
     accelerator = Accelerator(
         gradient_accumulation_steps=(args.gradient_accumulation_steps or 1),
         log_with="wandb" if not args.no_wandb else None,
-        project_dir=args.output_dir
+        project_dir=args.output_dir,
+        step_scheduler_with_optimizer=False,  # We manually control scheduler.step()
+        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)]
     )
     
     # Set DeepSpeed micro batch size/grad accumulation if using DeepSpeed
@@ -426,7 +494,7 @@ def main():
         freeze_fone_rows=not args.no_freeze_fone
     )
     
-    # Enable activation checkpointing
+    # Enable activation checkpointing (disabled by default; can be re-enabled by flag)
     if args.activation_checkpointing:
         model.gradient_checkpointing_enable()
         logger.info("Enabled activation checkpointing")
@@ -491,10 +559,18 @@ def main():
         num_processes=processes_factor
     )
     
+    # Adjust warmup steps if needed (don't warmup longer than 10% of training)
+    effective_warmup_steps = min(args.warmup_steps, int(total_steps * 0.1))
+    if effective_warmup_steps < args.warmup_steps:
+        logger.info(f"Reducing warmup steps from {args.warmup_steps} to {effective_warmup_steps} (10% of {total_steps} total steps)")
+    
+    logger.info(f"Creating LR scheduler with {total_steps} total steps and {effective_warmup_steps} warmup steps")
+    
     # Create learning rate scheduler
+    # NOTE: total_steps is already the number of optimizer steps (accounts for gradient accumulation)
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
-        num_warmup_steps=args.warmup_steps,
+        num_warmup_steps=effective_warmup_steps,
         num_training_steps=total_steps
     )
     
@@ -542,14 +618,12 @@ def main():
                 # Training step
                 metrics = train_step(model, batch, accelerator)
                 
-                # Gradient clipping
+                # Gradient clipping and optimizer step
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), args.grad_clip)
-                
-                # Optimizer step
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
                 
                 # Update step counter
                 if accelerator.sync_gradients:
@@ -610,7 +684,9 @@ def main():
                     if step % args.save_every_steps == 0:
                         checkpoint_path = os.path.join(args.output_dir, f"step_{step}")
                         save_checkpoint(
-                            accelerator, model, tokenizer, step, args.output_dir, fone_info
+                            accelerator, model, tokenizer, step, args.output_dir, fone_info, 
+                            args.hf_repo_id, args.fone_hi,
+                            args.cleanup_after_upload, args.keep_local_checkpoints
                         )
                         
                         # Run validation after saving checkpoint
@@ -627,7 +703,9 @@ def main():
     # Final checkpoint
     if accelerator.is_main_process:
         save_checkpoint(
-            accelerator, model, tokenizer, step, args.output_dir, fone_info
+            accelerator, model, tokenizer, step, args.output_dir, fone_info, 
+            args.hf_repo_id, args.fone_hi,
+            args.cleanup_after_upload, args.keep_local_checkpoints
         )
         
         logger.info(f"Training completed after {step} steps")

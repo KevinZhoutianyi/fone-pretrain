@@ -2,8 +2,7 @@
 FoNE (Fourier Number Embedding) initialization and override logic.
 
 This module implements the FoNE feature extraction for numbers 0-999 and their
-space-prefixed variants, replacing token embeddings with frozen FoNE features
-passed through a learnable linear projection.
+space-prefixed variants, replacing token embeddings with zero-padded frozen FoNE features.
 """
 
 import torch
@@ -16,34 +15,33 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def fone6(x: int) -> torch.Tensor:
+def fone_features(x: int) -> torch.Tensor:
     """
-    Compute the 6-dimensional FoNE feature for integer x.
+    Compute the 18-dimensional FoNE feature for integer x using multiple frequencies.
     
     Args:
         x: Integer in range [0, 999]
         
     Returns:
-        6-dimensional tensor: [cos(x0/10), sin(x0/10), cos(x1/10), sin(x1/10), cos(x2/10), sin(x2/10)]
-        where x0, x1, x2 are units, tens, hundreds digits respectively.
+        18-dimensional tensor: [cos(2π*x/T), sin(2π*x/T)] for T in [2, 5, 10, 20, 50, 100, 200, 500, 1000]
     """
-    # Zero-pad to 3 digits and extract digits
-    x_str = f"{x:03d}"
-    x2 = int(x_str[0])  # hundreds
-    x1 = int(x_str[1])  # tens  
-    x0 = int(x_str[2])  # units
+    # Frequency periods
+    periods = [2, 5, 10, 20, 50, 100, 200, 500, 1000]
     
-    # Compute FoNE features (using radians as specified, no 2π)
-    features = torch.tensor([
-        np.cos(x0 / 10.0),  # units cos
-        np.sin(x0 / 10.0),  # units sin
-        np.cos(x1 / 10.0),  # tens cos
-        np.sin(x1 / 10.0),  # tens sin
-        np.cos(x2 / 10.0),  # hundreds cos
-        np.sin(x2 / 10.0),  # hundreds sin
-    ], dtype=torch.float32)
+    features = []
+    for T in periods:
+        # Compute cos(2π*x/T) and sin(2π*x/T)
+        angle = 2 * np.pi * x / T
+        features.append(np.cos(angle))
+        features.append(np.sin(angle))
     
-    return features
+    return torch.tensor(features, dtype=torch.float32)
+
+
+# Legacy alias for backward compatibility
+def fone6(x: int) -> torch.Tensor:
+    """Legacy 6D FoNE (deprecated). Use fone_features() instead."""
+    return fone_features(x)
 
 
 def find_number_tokens(tokenizer: PreTrainedTokenizer, hi: int = 999) -> Dict[str, List[int]]:
@@ -114,17 +112,25 @@ def add_missing_number_tokens(tokenizer: PreTrainedTokenizer, missing_tokens: Li
     return []
 
 
-class FrozenEmbeddingHook:
-    """Hook to freeze specific embedding rows during training."""
+def pad_fone_features(fone_feats: torch.Tensor, hidden_size: int) -> torch.Tensor:
+    """
+    Pad 18D FoNE features with zeros to match the hidden dimension.
     
-    def __init__(self, frozen_indices: Set[int]):
-        self.frozen_indices = frozen_indices
+    Args:
+        fone_feats: 18-dimensional FoNE features
+        hidden_size: Target hidden dimension
         
-    def __call__(self, grad: torch.Tensor) -> torch.Tensor:
-        """Zero out gradients for frozen embedding rows."""
-        if grad is not None:
-            grad[list(self.frozen_indices)] = 0.0
-        return grad
+    Returns:
+        Zero-padded features of size hidden_size
+    """
+    # Get the FoNE feature dimension (18 for the new method)
+    fone_dim = fone_feats.shape[0]
+    
+    # Create zero tensor of target size
+    padded = torch.zeros(hidden_size, dtype=fone_feats.dtype, device=fone_feats.device)
+    # Copy FoNE features to the beginning
+    padded[:fone_dim] = fone_feats
+    return padded
 
 
 def apply_fone_overrides(
@@ -135,15 +141,16 @@ def apply_fone_overrides(
 ) -> Dict[str, any]:
     """
     Apply FoNE overrides to model embeddings for numbers 0-hi.
+    FoNE features are zero-padded to match hidden dimension and frozen.
     
     Args:
         model: LlamaForCausalLM model
         tokenizer: HuggingFace tokenizer
         hi: Maximum number to override (inclusive, default 999)
-        freeze_rows: Whether to freeze the overridden embedding rows
+        freeze_rows: Whether to freeze the FoNE embedding rows (True for training)
         
     Returns:
-        Dict containing override information and fone_proj module
+        Dict containing override information
     """
     logger.info(f"Applying FoNE overrides for numbers 0-{hi}")
     
@@ -168,18 +175,15 @@ def apply_fone_overrides(
             token_info = find_number_tokens(tokenizer, hi)
             found_tokens = token_info['found']
     
-    # Create or get the FoNE projection layer (match embedding dtype/device)
+    # Get embedding layer configuration
     d_model = model.config.hidden_size
     embed_tokens = model.get_input_embeddings()
     target_device = embed_tokens.weight.device
     target_dtype = embed_tokens.weight.dtype
-    if not hasattr(model, 'fone_proj'):
-        proj = nn.Linear(6, d_model, bias=False)
-        proj = proj.to(device=target_device, dtype=target_dtype)
-        model.fone_proj = proj
-        logger.info(f"Created FoNE projection layer: 6 -> {d_model}")
     
-    # Apply overrides to embedding matrix
+    logger.info(f"Using zero-padded FoNE features: 18 features (9 frequencies × 2) + {d_model - 18} zeros = {d_model} dimensions")
+    
+    # Initialize embeddings with zero-padded FoNE features
     overridden_indices = set()
     
     with torch.no_grad():
@@ -189,41 +193,47 @@ def apply_fone_overrides(
             try:
                 num_value = int(num_str)
                 if 0 <= num_value <= hi:
-                    # Compute FoNE features
-                    fone_features = fone6(num_value).to(
-                        device=embed_tokens.weight.device,
-                        dtype=embed_tokens.weight.dtype,
+                    # Compute FoNE features (18D with multiple frequencies)
+                    fone_feats = fone_features(num_value).to(
+                        device=target_device,
+                        dtype=target_dtype,
                     )
                     
-                    # Project through learnable layer (stays in model dtype)
-                    projected = model.fone_proj(fone_features)
+                    # Pad with zeros to match hidden dimension
+                    padded_features = pad_fone_features(fone_feats, d_model)
                     
-                    # Override embedding
-                    embed_tokens.weight[token_id] = projected
+                    # Initialize embedding
+                    embed_tokens.weight[token_id] = padded_features
                     overridden_indices.add(token_id)
                     
-                    logger.debug(f"Override token {token_id} ('{token_str}') with FoNE({num_value})")
+                    logger.debug(f"Initialize token {token_id} ('{token_str}') with zero-padded FoNE({num_value})")
                     
             except ValueError:
                 logger.warning(f"Could not parse number from token: '{token_str}'")
                 continue
     
-    logger.info(f"Applied FoNE overrides to {len(overridden_indices)} embedding rows")
+    logger.info(f"Initialized {len(overridden_indices)} embedding rows with zero-padded FoNE features")
     
-    # Set up freezing hook if requested
-    frozen_hook = None
+    # Freeze the number embedding rows if requested
     if freeze_rows and overridden_indices:
-        frozen_hook = FrozenEmbeddingHook(overridden_indices)
-        embed_tokens.weight.register_hook(frozen_hook)
-        logger.info(f"Registered freezing hook for {len(overridden_indices)} embedding rows")
+        # Create a parameter hook to zero out gradients for frozen rows
+        def freeze_number_embeddings_hook(grad):
+            """Zero out gradients for number embedding rows."""
+            grad_clone = grad.clone()
+            for idx in overridden_indices:
+                grad_clone[idx] = 0.0
+            return grad_clone
+        
+        # Register the hook on the embedding weight
+        embed_tokens.weight.register_hook(freeze_number_embeddings_hook)
+        logger.info(f"Froze {len(overridden_indices)} number embedding rows via gradient hook")
+        logger.info("Number embeddings will remain fixed during training")
     
     # Return information about the overrides
     return {
         'overridden_indices': overridden_indices,
         'num_overridden': len(overridden_indices),
         'added_tokens': added_tokens,
-        'fone_proj': model.fone_proj,
-        'frozen_hook': frozen_hook,
         'found_tokens': found_tokens,
         'missing_tokens': missing_tokens
     }
@@ -232,6 +242,7 @@ def apply_fone_overrides(
 def verify_fone_overrides(model: nn.Module, tokenizer: PreTrainedTokenizer, hi: int = 999) -> bool:
     """
     Verify that FoNE overrides have been applied correctly.
+    Checks that embeddings match zero-padded FoNE features.
     
     Args:
         model: Model to verify
@@ -241,12 +252,14 @@ def verify_fone_overrides(model: nn.Module, tokenizer: PreTrainedTokenizer, hi: 
     Returns:
         True if verification passes, False otherwise
     """
-    if not hasattr(model, 'fone_proj'):
-        logger.error("Model does not have fone_proj layer")
-        return False
-        
+    # Skip verification if FoNE is disabled (hi < 0 means no number embeddings)
+    if hi < 0:
+        logger.info("FoNE disabled (hi < 0), skipping verification")
+        return True
+    
     embed_tokens = model.get_input_embeddings()
     token_info = find_number_tokens(tokenizer, hi)
+    d_model = model.config.hidden_size
     
     verification_passed = True
     
@@ -255,12 +268,12 @@ def verify_fone_overrides(model: nn.Module, tokenizer: PreTrainedTokenizer, hi: 
         try:
             num_value = int(num_str)
             if 0 <= num_value <= hi:
-                # Compute expected FoNE features
-                expected_fone = fone6(num_value).to(
+                # Compute expected zero-padded FoNE features
+                expected_fone = fone_features(num_value).to(
                     device=embed_tokens.weight.device,
                     dtype=embed_tokens.weight.dtype,
                 )
-                expected_embedding = model.fone_proj(expected_fone)
+                expected_embedding = pad_fone_features(expected_fone, d_model)
                 
                 # Compare with actual embedding (cast to float32 for stable comparison)
                 actual_embedding = embed_tokens.weight[token_id]
@@ -279,3 +292,53 @@ def verify_fone_overrides(model: nn.Module, tokenizer: PreTrainedTokenizer, hi: 
         logger.error("FoNE override verification failed")
         
     return verification_passed
+
+
+def finalize_fone_embeddings(model: nn.Module, tokenizer: PreTrainedTokenizer, hi: int = 999):
+    """
+    Finalize FoNE embeddings after training.
+    Since embeddings are frozen with zero-padded FoNE features, this is a no-op,
+    but kept for compatibility with existing checkpoint code.
+    
+    Args:
+        model: Trained model
+        tokenizer: Tokenizer
+        hi: Maximum number for FoNE
+    """
+    # Skip finalization if FoNE is disabled (baseline model)
+    if hi < 0:
+        logger.info("FoNE disabled (hi < 0), skipping finalization")
+        return
+    
+    logger.info("FoNE embeddings are already frozen with zero-padded features - no finalization needed")
+    
+    # Verify embeddings are still correct
+    token_info = find_number_tokens(tokenizer, hi)
+    found_tokens = token_info['found']
+    embed_tokens = model.get_input_embeddings()
+    d_model = model.config.hidden_size
+    
+    verified_count = 0
+    with torch.no_grad():
+        for token_str, token_id in found_tokens:
+            num_str = token_str.strip()
+            try:
+                num_value = int(num_str)
+                if 0 <= num_value <= hi:
+                    # Verify embedding is still zero-padded FoNE
+                    expected_fone = fone_features(num_value).to(
+                        device=embed_tokens.weight.device,
+                        dtype=embed_tokens.weight.dtype,
+                    )
+                    expected_embedding = pad_fone_features(expected_fone, d_model)
+                    actual_embedding = embed_tokens.weight[token_id]
+                    
+                    if torch.allclose(actual_embedding, expected_embedding, atol=1e-5):
+                        verified_count += 1
+                    else:
+                        logger.warning(f"Number embedding {token_id} ('{token_str}') has drifted from expected FoNE value")
+                    
+            except ValueError:
+                continue
+    
+    logger.info(f"Verified {verified_count}/{len(found_tokens)} FoNE embeddings remain frozen")

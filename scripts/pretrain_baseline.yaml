@@ -1,0 +1,30 @@
+# Baseline Pretraining Configuration
+# LLaMA 1.5B WITHOUT FoNE (standard model)
+
+model_config: configs/llama_1p5b_baseline.json
+data_config: configs/data_local_1p5b_1x.json
+
+# Training hyperparameters (same as FoNE for fair comparison)
+per_device_train_batch_size: 6
+gradient_accumulation_steps: 4
+learning_rate: 3.0e-4
+warmup_steps: 3000
+weight_decay: 0.1
+save_every_steps: 10000
+log_every_steps: 10
+
+# Distributed training
+num_processes: 8
+mixed_precision: bf16
+dataloader_num_workers: 0
+
+# Wandb logging
+wandb_project: fone-pretraining
+wandb_run_name: baseline_1p5b
+
+# HuggingFace upload (checkpoints will be uploaded here and cleaned up locally)
+hf_repo_id: Onlydrinkwater/baseline-1p5b
+
+# FoNE specific: -1 disables FoNE number embeddings
+fone_hi: -1
+

@@ -1,0 +1,8 @@
+{
+  "dataset": "gsm8k",
+  "format": "instruction_following_cot",
+  "train_samples": 7473,
+  "test_samples": 1319,
+  "prompt_template": "Question: {question}\\nAnswer: Let's think step by step.",
+  "completion_template": " {reasoning}\\nThe answer is {answer}."
+}

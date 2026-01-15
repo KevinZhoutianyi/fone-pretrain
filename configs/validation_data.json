@@ -1,9 +1,0 @@
-{
-  "streams": [
-    { "name": "fineweb",      "hf": "HuggingFaceFW/fineweb",     "split": "train", "weight": 0.7 },
-    { "name": "fineweb_edu",  "hf": "HuggingFaceFW/fineweb-edu", "split": "train", "weight": 0.2 },
-    { "name": "wikipedia_en", "hf": "wikimedia/wikipedia",       "config": "20231101.en", "split": "train", "weight": 0.1 }
-  ],
-  "shuffle_buffer_size": 10000,
-  "num_workers": 2
-}
